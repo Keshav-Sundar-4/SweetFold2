@@ -1,0 +1,5 @@
+version: 1
+sequences:
+  - glycan:
+      id: B
+      iupac: 'BGC(b1-4)BGC(b1-4)BGC(b1-4)RAM(a1-2)BGC(a1-4)FUC(b1-4)BGC(b1-4)BGC(b1-4)BGC(b1-4)RAM(a1-2)BGC(a1-4)FUC(b1-4)BGC(b1-4)BGC(b1-4)BGC'
