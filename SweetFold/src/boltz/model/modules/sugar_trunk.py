@@ -3,9 +3,6 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 from typing import Dict, Any, Tuple
-import sys
-import pkg_resources
-import json
 
 from boltz.data import const
 import torch.nn.functional as F
@@ -30,11 +27,7 @@ from boltz.data.feature.featurizer import MONO_TYPE_MAP
 #############################################################################################################
 #############################################################################################################
 
-NUM_MONO_TYPES_PLACEHOLDER = 931 # As derived from the provided map example (+1 for OTHER)
 NUM_ANOMERIC_TYPES = 3
-#NUM_MONO_TYPES = len(NUM_MONO_TYPES_PLACEHOLDER)
-D_MONO_EMB = 64
-NUM_AMINO_ACIDS = 22
 
 #############################################################################################################
 #############################################################################################################
@@ -50,9 +43,6 @@ class StereoProjector(nn.Module):
       - monosaccharide type
       - full 4-character atom name for atom i
       - full 4-character atom name for atom j
-
-    This preserves names like C10, N2A, C1A, etc., instead of collapsing
-    them to only the first two characters.
     """
 
     def __init__(
@@ -141,15 +131,7 @@ def compute_glycan_stereobias(
     stereo_proj: nn.Module,
 ) -> torch.Tensor:
     """
-    Computes a dense, all-to-all stereo prior for each monosaccharide.
-
-    Direct stereobias relationships are generated among atoms belonging to the
-    same monosaccharide residue, with one exception: a bonded external glycosidic
-    non-carbon atom from the same glycan chain may be included as a hinge atom
-    for the residue it is not part of.
-
-    This version preserves the full 4-character atom name, so atoms like C10,
-    N2A, C1A, etc. remain distinguishable.
+    Computes an all-to-all stereo prior for each monosaccharide.
     """
 
     if "mono_type" not in feats or "token_to_mono_idx" not in feats:
@@ -220,16 +202,13 @@ def compute_glycan_stereobias(
             m_type_int = int(mono_types[b, m_indices[0]].item())
             m_chain_id = asym_id[b, m_indices[0]]
 
-            # Maps global token idx -> encoded 4-char atom name tensor [4].
             grid_nodes: Dict[int, torch.Tensor] = {}
 
-            # 1. Add all atoms in the current monosaccharide residue.
+            # Add all atoms in the current monosaccharide residue.
             for i in m_indices:
                 idx = int(i.item())
                 grid_nodes[idx] = get_token_name_chars(b, idx)
 
-            # 2. Add the glycosidic hinge atom from a neighboring residue.
-            # This is the only allowed cross-residue inclusion.
             for i in m_indices:
                 idx = int(i.item())
 
@@ -266,12 +245,6 @@ def compute_glycan_stereobias(
                     external_name_chars = get_token_name_chars(b, n_idx)
                     external_name = decode_chars(external_name_chars)
 
-                    # Alias based on the current residue atom it is bonded to.
-                    # Example:
-                    #   internal C1 bonded to external O4 -> external hinge alias O1
-                    #   internal C10 bonded to external O? -> alias O10
-                    #
-                    # This preserves multi-character positions up to 4 chars total.
                     c_num = "".join(ch for ch in internal_name if ch.isdigit())
                     if not c_num:
                         c_num = "1"
@@ -325,141 +298,6 @@ def compute_glycan_stereobias(
             z_bias[b, row_nodes, col_nodes] += bias_patch
 
     return z_bias
-            
-def get_anomeric_pair_features(feats: Dict[str, Tensor]) -> Tensor:
-    """
-    Returns a [B, L, L, NUM_ANOMERIC_TYPES] tensor containing the one-hot anomeric
-    configuration for valid intra-glycan bonds. 
-    This extracts the explicit edge bias needed after we have collapsed the tokens.
-    """
-    device = feats['token_pad_mask'].device
-    B, L = feats['token_pad_mask'].shape
-
-    # Grab the true anomeric state instead of the mono type
-    dummy_anomeric = feats.get("mono_anomeric", torch.zeros(B, L, NUM_ANOMERIC_TYPES, device=device, dtype=torch.float32))
-
-    if "mono_anomeric" not in feats:
-        return torch.zeros((B, L, L, NUM_ANOMERIC_TYPES), device=device, dtype=torch.float32)
-
-    # 1. Identify glycan tokens
-    is_mono_feat = feats.get("is_monosaccharide", torch.zeros((B, L, 1), device=device))
-    is_glycan = is_mono_feat.squeeze(-1) > 0.5 
-    
-    # 2. Identify tokens within the same chain
-    b_same_chain = torch.eq(feats.get("asym_id", torch.zeros((B, L), device=device))[:, :, None], 
-                            feats.get("asym_id", torch.zeros((B, L), device=device))[:, None, :])
-    
-    # 3. Create mask for ALL Intra-Chain Glycan pairs
-    intra_glycan_graph_mask = is_glycan[:, :, None] & is_glycan[:, None, :] & b_same_chain
-
-    # 4. Get valid edges using the ground-truth bond graph
-    raw_bonds = feats.get("token_bonds", torch.zeros((B, L, L, 1), device=device)).squeeze(-1).bool()
-    glycan_edges = raw_bonds & intra_glycan_graph_mask
-
-    # 5. Determine Carbon atoms for directionality (Inter-residue bonds)
-    ref_elem = feats.get('ref_element', torch.zeros((B, L, 1), device=device)).float()
-    selector = feats.get('token_to_rep_atom', torch.zeros((B, L, L), device=device)).float()
-    token_elem_oh = torch.einsum('bla,bae->ble', selector, ref_elem)
-    token_elem = token_elem_oh.argmax(dim=-1)
-    is_C = (token_elem == 6)
-
-    anomeric_i = dummy_anomeric.unsqueeze(2).expand(-1, -1, L, -1)
-    anomeric_j = dummy_anomeric.unsqueeze(1).expand(-1, L, -1, -1)
-    
-    is_C_i = is_C.view(B, L, 1, 1)
-    is_C_j = is_C.view(B, 1, L, 1)
-    
-    # For glycosidic bonds, the anomeric feature defaults to the Carbon's state.
-    # If token j is Carbon and token i is not, use j's state. Otherwise, use i's state.
-    selected_anomeric = torch.where(
-        is_C_j & ~is_C_i,
-        anomeric_j,
-        anomeric_i
-    )
-    
-    return selected_anomeric * glycan_edges.unsqueeze(-1).float()
-
-def stereo_discovery(
-    mono_indices: torch.Tensor,
-    bond_matrix: torch.Tensor,
-) -> list[dict]:
-    """
-    Simplified singular-anchor topological discovery.
-    """
-    num_atoms = mono_indices.shape[0]
-    local_bonds = bond_matrix[mono_indices][:, mono_indices]
-    adj_list = [torch.where(local_bonds[i])[0].tolist() for i in range(num_atoms)]
-
-    # Find cycles (rings)
-    def find_cycles(nodes, adj):
-        cycles = []
-        for start_node in range(len(nodes)):
-            stack = [(start_node, [start_node])]
-            while stack:
-                node, path = stack.pop()
-                for neighbor in adj[node]:
-                    if neighbor == start_node and len(path) in [5, 6]:
-                        cycles.append(path)
-                    elif neighbor not in path and len(path) < 6:
-                        stack.append((neighbor, path + [neighbor]))
-        return cycles
-
-    all_cycles = find_cycles(range(num_atoms), adj_list)
-    if not all_cycles:
-        return []
-    
-    main_ring = all_cycles[0]
-    ring_set = set(main_ring)
-    discovery_results = []
-    
-    for r_idx in main_ring:
-        for n_idx in adj_list[r_idx]:
-            if n_idx not in ring_set:
-                # n_idx is substituent. Find singular anchor.
-                # In a 6-ring, the 'opposite' atom is index + 3 (modulo ring size)
-                ring_pos = main_ring.index(r_idx)
-                # We pick the atom roughly 'across' the ring
-                opp_pos = (ring_pos + len(main_ring) // 2) % len(main_ring)
-                anchor_idx = main_ring[opp_pos]
-                
-                discovery_results.append({
-                    'sub_idx': n_idx,
-                    'anchor_indices': [anchor_idx] # Now a singular anchor
-                })
-    return discovery_results
-            
-def build_couplet_pair_mask(feats: Dict[str, Tensor]) -> Tensor:
-    """
-    Locate glycosidic couplets and return a boolean mask [B, L, L] where
-    mask[b, i, j] = True iff token i is a nucleophile (O or N), token j is carbon,
-    they are bonded, and they belong to different monosaccharides.
-    """
-    token_bonds    = feats["token_bonds"].squeeze(-1).bool()      # [B, L, L]
-    token_to_mono = feats["token_to_mono_idx"]                  # [B, L]
-
-    # derive atomic numbers
-    ref_elem_oh = feats["ref_element"].float()                  # [B, A, E]
-    selector    = feats["token_to_rep_atom"].float()            # [B, L, A]
-    elem_oh     = torch.einsum("bla,bae->ble", selector, ref_elem_oh)
-    atom_num    = elem_oh.argmax(dim=-1)                        # [B, L]
-    is_O        = atom_num == 8
-    is_N        = atom_num == 7
-    is_C        = atom_num == 6
-
-    # A glycosidic nucleophile can be Oxygen or Nitrogen
-    is_nucleophile = is_O | is_N
-
-    # inter‑monosaccharide bonds only
-    mono_i      = token_to_mono.unsqueeze(2)                    # [B, L, 1]
-    mono_j      = token_to_mono.unsqueeze(1)                    # [B, 1, L]
-    inter_mono  = token_bonds & (mono_i != mono_j)
-
-    # mask nucleophile→carbon bonds
-    mask_nuc_to_C = inter_mono & is_nucleophile.unsqueeze(2) & is_C.unsqueeze(1) # True if row_idx is O/N, col_idx is C
-    # also identify carbon->nucleophile bonds for symmetry
-    mask_C_to_nuc = inter_mono & is_C.unsqueeze(2) & is_nucleophile.unsqueeze(1) # True if row_idx is C, col_idx is O/N
-    
-    return mask_nuc_to_C | mask_C_to_nuc
 
 def _decode_atom_name(one_hot_encoded_name: torch.Tensor) -> str:
     integer_indices = torch.argmax(one_hot_encoded_name, dim=-1)
@@ -492,8 +330,6 @@ def _get_glycosylation_features(feats: Dict[str, Any]) -> Dict[str, torch.Tensor
     """
     (Streamlined & Instrumented Version)
     Extracts the token indices of the specific protein-glycan covalent attachment points.
-    This version is simplified to only compute what is used by the debug print function,
-    removing extraneous feature generation.
     """
     device = feats["token_pad_mask"].device
     B, L = feats["token_pad_mask"].shape
@@ -639,7 +475,7 @@ class SugarPairformerLayer(nn.Module):
         """
         padding_pair_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
         
-        # --- Z (Pairwise) Updates ---
+        # --- Z Updates ---
         z = z + get_dropout_mask(self.dropout, z, self.training) * self.tri_mul_out(z, mask=padding_pair_mask)
         z = z + get_dropout_mask(self.dropout, z, self.training) * self.tri_mul_in(z, mask=padding_pair_mask)
         z = z + get_dropout_mask(self.dropout, z, self.training) * self.tri_att_start(z, mask=padding_pair_mask, chunk_size=chunk_size_tri_attn)
@@ -648,7 +484,7 @@ class SugarPairformerLayer(nn.Module):
         if z_bias_continuous is not None:
             z = z + z_bias_continuous
 
-        # --- S (Single) Updates ---
+        # --- S Updates ---
         s = s + self.attention(s, z, mask=mask)
         s = s + self.transition_s(s)
         if s_bias_continuous is not None:
@@ -719,12 +555,7 @@ class SugarPairformerModule(nn.Module):
 
 class SugarPairformer(nn.Module):
     """
-    (Corrected for DDP)
-    A specialist module that refines glycan representations.
-    This version uses a gather-batch-process-scatter approach to guarantee
-    mathematical isolation for each glycan chain while remaining compatible
-    with DDP and activation checkpointing by making only a single call
-    to its core processing stack.
+    Module that refines glycan representations.
     """
     def __init__(
         self,
@@ -755,12 +586,7 @@ class SugarPairformer(nn.Module):
 
     def forward(self, s_input: Tensor, z_input: Tensor, feats: Dict[str, Any], s_bias_continuous: Tensor | None = None, z_bias_continuous: Tensor | None = None) -> Tuple[Tensor, Tensor]:
         """
-        Extracts glycan representations, processes them in a single batched call,
-        and scatters the results back. This module is designed to operate only on
-        tokens identified as part of a monosaccharide, leaving all other token
-        representations mathematically unchanged. If no glycans are present in a batch,
-        it uses a parameter-summing mechanism to ensure compatibility with Distributed
-        Data Parallel (DDP) training without performing any data processing.
+        Extracts glycan representations
         """
         B, N, _ = s_input.shape
         
@@ -771,7 +597,7 @@ class SugarPairformer(nn.Module):
         glycan_s_bias_list, glycan_z_bias_list = [], []
         scatter_map = []
 
-        # 1. GATHER (Only if there are any glycans in the batch)
+        # gather
         if torch.any(is_glycan_token):
             s_out = s_input.clone()
             z_out = z_input.clone()
@@ -798,18 +624,15 @@ class SugarPairformer(nn.Module):
                         
                     scatter_map.append({'batch_idx': b, 'indices': glycan_indices})
 
-        # If no glycan chains were gathered across the entire batch, apply the DDP-safe exit.
+        # Exit
         if not glycan_s_list:
-            # DDP-safe exit: "touch" all parameters in the stack by summing them.
-            # This adds them to the computation graph without running a forward pass.
-            # The result is multiplied by 0.0, ensuring no mathematical impact.
             dummy_loss = 0.0
             for p in self.sugar_pairformer_stack.parameters():
                 dummy_loss += p.sum()
             
             return s_input + (dummy_loss * 0.0), z_input + (dummy_loss * 0.0)
 
-        # 2. PAD & BATCH
+        # Pad
         max_glycan_len = max(s.shape[0] for s in glycan_s_list)
         s_padded_list, z_padded_list, mask_padded_list = [], [], []
         s_bias_padded_list, z_bias_padded_list = [], []
@@ -841,13 +664,12 @@ class SugarPairformer(nn.Module):
         s_bias_batch = torch.stack(s_bias_padded_list, dim=0) if s_bias_continuous is not None else None
         z_bias_batch = torch.stack(z_bias_padded_list, dim=0) if z_bias_continuous is not None else None
 
-        # 3. SINGLE PROCESS CALL
         s_refined_batch, z_refined_batch = self.sugar_pairformer_stack(
             s=s_batch, z=z_batch, mask=mask_batch.float(),
             s_bias_continuous=s_bias_batch, z_bias_continuous=z_bias_batch
         )
 
-        # 4. UNBATCH & SCATTER
+        # Scatter
         for i, meta in enumerate(scatter_map):
             b, original_indices = meta['batch_idx'], meta['indices']
             original_len = len(original_indices)
